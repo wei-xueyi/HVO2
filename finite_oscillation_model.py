@@ -12,11 +12,13 @@
 
 这个模块刻意保持为最小物理模型，不显式引入温度场、空间氢浓度或
 相界面位置。这些影响被降阶到两个电流依赖函数：
-``frequency_hz`` 和 ``strengthening_rate_per_s``。
+``frequency_hz`` 和 ``strengthening_rate_per_s``。后者默认由拟合的
+振荡持续时间曲线反推。
 """
 
 from __future__ import annotations
 
+import warnings
 from dataclasses import dataclass
 from typing import Callable
 
@@ -25,6 +27,27 @@ import numpy as np
 
 CurrentFunction = Callable[[float], float]
 WaveformFunction = Callable[[np.ndarray], np.ndarray]
+DurationCurveFunction = Callable[[float], float]
+
+MIN_OSCILLATION_CURRENT_MA = 4.55
+DURATION_CURVE_KNEE_CURRENT_MA = 6.099924
+
+
+class BelowThresholdCurrentWarning(RuntimeWarning):
+    """A nonzero input is below the current required to start oscillation."""
+
+
+def fitted_oscillation_duration_ms(current_ma: float) -> float:
+    """Default digitized duration fit; replace this callable when refitting data."""
+    current = abs(float(current_ma))
+    if current <= DURATION_CURVE_KNEE_CURRENT_MA:
+        return 90.0
+
+    delta_current = current - DURATION_CURVE_KNEE_CURRENT_MA
+    return (
+        79.4 * np.exp(-((delta_current / 0.2613) ** 2))
+        + 10.6 * np.exp(-((delta_current / 1.2998) ** 2))
+    )
 
 
 #全部参数定义，初始参数确定后不许修改
@@ -35,30 +58,19 @@ class ModelParameters:
     电流单位为 mA，时间单位为秒，频率单位为 Hz，电阻单位为欧姆。
     """
 
-    # 下面这组参数只负责把电流映射成两个量：
-    # 1. `frequency_hz(current_ma)`：决定振荡相位前进速度；
-    # 2. `strengthening_rate_per_s(current_ma)`：决定慢变量 h 的增长速度。
-    # 其中 `reference_*` 是拟合参考点，`*_slope_*` 是电流变化带来的线性斜率，
-    # `minimum_*` 是下限，避免在低电流时被算成不合理的小值。
-    # 默认值来自高频单器件数据的第一版拟合：
-    # 7.32 mA 附近频率约 21.6 kHz、寿命约 13.2 ms；
-    # 7.50 mA 附近寿命约 8.2 ms。
-    # 低电流下的长寿命边界由下面的最小强化速率表示。
+    # 频率拟合 f[kHz] = 18.56248169 + 0.42087232 * abs(current[mA])，
+    # 以下用兼容的参考点形式存储，frequency_hz 仍返回 Hz。
     reference_current_ma: float = 7.32
-    # 频率拟合的参考点：电流等于 reference_current_ma 时，频率约为该值。
-    reference_frequency_hz: float = 21_580.0
-    # 电流每增加 1 mA，振荡频率大致增加多少 Hz。
-    frequency_slope_hz_per_ma: float = 670.0
-    # 振荡频率的物理下限，避免低电流时退化为 0。
+    reference_frequency_hz: float = 21_643.2670724
+    frequency_slope_hz_per_ma: float = 420.87232
     minimum_frequency_hz: float = 1.0
 
-    # h 增长速率拟合的参考点：电流等于 reference_current_ma 时，
-    # 慢变量每秒增长约多少。
+    # 强化速率回退模型使用的参考点；启用 duration_curve_ms 时不使用。
     reference_strengthening_rate_per_s: float = 75.76
-    # 电流每增加 1 mA，h 的增长速率大致增加多少 1/s。
     strengthening_slope_per_s_per_ma: float = 256.63
-    # h 增长速率的下限，保证恢复时间和寿命估计不会失真。
     minimum_strengthening_rate_per_s: float = 9.52
+    minimum_oscillation_current_ma: float = MIN_OSCILLATION_CURRENT_MA
+    duration_curve_ms: DurationCurveFunction | None = fitted_oscillation_duration_ms
 
     recovery_time_s: float = 1.0
 
@@ -71,6 +83,13 @@ class ModelParameters:
             raise ValueError("minimum_frequency_hz must be positive")
         if self.minimum_strengthening_rate_per_s <= 0:
             raise ValueError("minimum_strengthening_rate_per_s must be positive")
+        if (
+            not np.isfinite(self.minimum_oscillation_current_ma)
+            or self.minimum_oscillation_current_ma <= 0
+        ):
+            raise ValueError("minimum_oscillation_current_ma must be finite and positive")
+        if self.duration_curve_ms is not None and not callable(self.duration_curve_ms):
+            raise TypeError("duration_curve_ms must be callable or None")
         if self.recovery_time_s <= 0:
             raise ValueError("recovery_time_s must be positive")
         if self.initial_high_resistance_ohm <= self.initial_low_resistance_ohm:
@@ -139,10 +158,10 @@ class FiniteOscillationNeuron:
         self.waveform = waveform or np.sin
 
     def frequency_hz(self, current_ma: float) -> float:
-        """计算电流相关的振荡频率。"""
-        #频率是对电流的线性函数,但是有下限,避免低电流时退化为0
-
+        """Return fitted frequency in Hz; inputs below the firing threshold return zero."""
         p = self.parameters
+        if abs(current_ma) < p.minimum_oscillation_current_ma:
+            return 0.0
         value = p.reference_frequency_hz + p.frequency_slope_hz_per_ma * (
             abs(current_ma) - p.reference_current_ma
         )
@@ -150,12 +169,19 @@ class FiniteOscillationNeuron:
 
     def strengthening_rate_per_s(self, current_ma: float) -> float:
         """计算慢变量 ``h`` 的电流相关强化速率。"""
-        #强化速率是对电流的线性函数,但是有下限,避免低电流时退化为0
-
         p = self.parameters
+        current = abs(current_ma)
+        if current < p.minimum_oscillation_current_ma:
+            return 0.0
+        if p.duration_curve_ms is not None:
+            duration_ms = float(p.duration_curve_ms(current))
+            if not np.isfinite(duration_ms) or duration_ms <= 0.0:
+                raise ValueError("duration_curve_ms must return a finite positive duration")
+            return 1000.0 / duration_ms
+
         value = p.reference_strengthening_rate_per_s + (
             p.strengthening_slope_per_s_per_ma
-            * (abs(current_ma) - p.reference_current_ma)
+            * (current - p.reference_current_ma)
         )
         return max(p.minimum_strengthening_rate_per_s, value)
 
@@ -163,7 +189,7 @@ class FiniteOscillationNeuron:
         """解析计算 ``h`` 到达上限前的内禀振荡寿命。"""
 
         self._validate_h(initial_h)
-        if initial_h >= 1.0:
+        if initial_h >= 1.0 or abs(current_ma) < self.parameters.minimum_oscillation_current_ma:
             return 0.0
         return (1.0 - initial_h) / self.strengthening_rate_per_s(current_ma)
 
@@ -217,6 +243,16 @@ class FiniteOscillationNeuron:
         current_ma = np.asarray([float(current(t)) for t in time_s], dtype=float)
         if not np.all(np.isfinite(current_ma)):
             raise ValueError("current(t) must return finite values")
+        below_threshold = (
+            (np.abs(current_ma) > 1.0e-15)
+            & (np.abs(current_ma) < self.parameters.minimum_oscillation_current_ma)
+        )
+        if np.any(below_threshold):
+            warnings.warn(
+                "Nonzero input below 4.55 mA detected; those samples do not oscillate.",
+                BelowThresholdCurrentWarning,
+                stacklevel=2,
+            )
 
         # 初始化输出数组
         theta_rad = np.empty_like(time_s)
@@ -231,7 +267,14 @@ class FiniteOscillationNeuron:
 
         for index, t_s in enumerate(time_s):
             input_on = not np.isclose(current_ma[index], 0.0, atol=1.0e-15)
-            oscillating[index] = input_on and h[index] < 1.0 - 1.0e-12
+            above_oscillation_threshold = (
+                abs(current_ma[index]) >= self.parameters.minimum_oscillation_current_ma
+            )
+            oscillating[index] = (
+                input_on
+                and above_oscillation_threshold
+                and h[index] < 1.0 - 1.0e-12
+            )
 
             # 电阻先由当前相位和慢变量计算，再在恒流条件下用 V=IR
             # 得到输出电压；这里不显式模拟电容充放电。
@@ -249,7 +292,7 @@ class FiniteOscillationNeuron:
             h[index + 1] = h[index]
 
 
-            if input_on and h[index] < 1.0:
+            if input_on and above_oscillation_threshold and h[index] < 1.0:
                 # 输入开启且尚未停振：相位按频率前进，慢变量线性强化。
                 # 当前版本使用 dh/dt=k(I)，便于直接由寿命反推 k。
                 theta_rad[index + 1] += (
@@ -260,7 +303,7 @@ class FiniteOscillationNeuron:
                     h[index]
                     + self.strengthening_rate_per_s(current_ma[index]) * step_s,
                 )
-            elif input_on:
+            elif input_on and h[index] >= 1.0:
                 # 饱和停振状态：输入仍在时，h 被锁定在 1。
                 h[index + 1] = 1.0
             elif h[index] > 0.0:

@@ -11,21 +11,35 @@ import numpy as np
 # 使用已有的有限振荡模型作为单像素动力学核心，不直接修改原模型文件。
 from finite_oscillation_model import FiniteOscillationNeuron, ModelParameters
 
+# Keep existing notebook imports working while intrinsic VO2 lives separately.
+from intrinsic_vo2_model import (
+    intrinsic_vo2_frequency_map,
+    map_intrinsic_vo2_frequency_to_grayscale,
+    simulate_intrinsic_vo2_exposure,
+)
+
 
 # 统一的错误码，表示“停振后又发生了二次起振”。
 ERROR_CODE_REACTIVATE_AFTER_STOP = "E_REACTIVATE_AFTER_STOP"
 # 默认视频采样率：50 fps，和之前的设计一致。
 DEFAULT_FPS = 50.0
 # 模型内部默认以 1 ms 步长积分；停振观察窗口固定为 3 个积分步长。
-DEFAULT_SIMULATION_DT_S = 1.0e-3
+DEFAULT_SIMULATION_DT_S = 1.0e-4
 STOP_WINDOW_STEPS = 3
+
+
+class InsufficientCurrentError(RuntimeError):
+    """整个输入阵列的电流均低于起振门槛。"""
+
+    def __init__(self) -> None:
+        super().__init__("电流太小无法起振")
 
 #复振报错
 class PixelReactivationError(RuntimeError):
-    """如果某个像素在停振后的 3 个仿真步长内再次起振，则直接抛错。
+    """像素在振荡中断后再次起振，包括低电流引起的中断。
 
-    这是对“判定是否稳定”的严格校验：只有首次停振真正不再复振，
-    才允许把它记入最终生成的输出图中。
+    复振检查覆盖整段仿真轨迹；首次饱和停振后仍观察 3 个步长，
+    再记录完成时间。
     """
 
     def __init__(self, pixel_indices: Iterable[tuple[int, int]], count: int) -> None:
@@ -33,8 +47,7 @@ class PixelReactivationError(RuntimeError):
         self.count = count
         self.error_code = ERROR_CODE_REACTIVATE_AFTER_STOP
         message = (
-            f"{self.error_code}: detected {count} pixels reactivated after stop "
-            "within the three-step rejection window."
+            f"{self.error_code}: 复振，检测到 {count} 个像素停振后再次起振。"
         )
         super().__init__(message)
 
@@ -54,7 +67,6 @@ class PixelResult:
     pulse_count: int
     pulse_frequency_hz: float
     completion_time_s: float
-
 
 class VideoPixelProcessor:
     """把视频帧转成逐像素电流序列，再交给 H-VO2 模型阵列进行仿真。
@@ -151,6 +163,18 @@ class VideoPixelProcessor:
         current = self.current_min_ma + (self.current_max_ma - self.current_min_ma) * normalized
         return (current) * self.gain
 
+    def validate_current_array(self, current_array: np.ndarray) -> None:
+        """在仿真和出图前，区分电流过小与观察时间不足。"""
+        current_array = np.asarray(current_array)
+        if current_array.ndim != 3 or current_array.size == 0:
+            raise ValueError("current_array must be nonempty with shape (frames, height, width)")
+        if not np.all(np.isfinite(current_array)):
+            raise ValueError("current_array must contain finite values")
+        if np.all(
+            np.abs(current_array) < self.model_parameters.minimum_oscillation_current_ma
+        ):
+            raise InsufficientCurrentError()
+
     def _make_step_current_function(
         self,
         frame_currents: np.ndarray,
@@ -185,13 +209,23 @@ class VideoPixelProcessor:
 
         判定规则：
         - 只要 h 达到 1 且系统当前不再振荡，就视为停振发生
-        - 紧接着观察固定的 3 个仿真步长内是否又重新振荡
-        - 若窗口内出现振荡，则判定为“异常复振”
-        - 否则认为首次停振稳定完成，记录该时间点作为输出时刻
+        - 任意振荡区间之间出现中断后再次起振，均判定为“异常复振”
+        - 复振检查覆盖整个轨迹，不限于饱和停振后的 3 步
+        - 首次饱和停振后观察 3 步，记录窗口末端作为输出时刻
         """
         h = np.asarray(result.h, dtype=float)
         oscillating = np.asarray(result.oscillating, dtype=bool)
         time_s = np.asarray(result.time_s, dtype=float)
+
+        # 先检查所有振荡区间，避免把低电流间隔计入频率统计。
+        # 起振前的等待不算复振；一旦开始振荡，任何中断后的再次起振都报错。
+        active_indices = np.flatnonzero(oscillating)
+        gaps = np.flatnonzero(np.diff(active_indices) > 1)
+        if gaps.size:
+            gap_index = int(gaps[0])
+            stop_idx = int(active_indices[gap_index]) + 1
+            restart_idx = int(active_indices[gap_index + 1])
+            return False, None, True, (stop_idx, restart_idx)
 
         # 找出第一次出现“h>=1 且当前不再振荡”的时间点。
         committed_stop = np.flatnonzero((h >= 1.0 - 1.0e-9) & (~oscillating))
@@ -199,14 +233,6 @@ class VideoPixelProcessor:
             return False, None, False, None
 
         first_stop_idx = int(committed_stop[0])
-        # 在停振后连续 3 个步长内，检查是否再次振荡。
-        check_stop = min(time_s.size - 1, first_stop_idx + self.stop_window_steps)
-        reactivated = bool(np.any(oscillating[first_stop_idx + 1 : check_stop + 1]))
-
-        if reactivated:
-            # 复振异常，直接标记该像素有问题。
-            return False, None, True, (first_stop_idx, int(np.argmax(oscillating[first_stop_idx + 1 : check_stop + 1]) + first_stop_idx + 1))
-
         # 窗口末端距首次停振完整经过 stop_window_steps 个仿真步长。
         completion_idx = min(first_stop_idx + self.stop_window_steps, time_s.size - 1)
         completion_time_s = float(time_s[completion_idx])
@@ -232,12 +258,19 @@ class VideoPixelProcessor:
         observation_duration_s = self.stop_window_steps * self.simulation_dt_s
         simulation_duration_s = total_duration_s + observation_duration_s
 
-        # 持续非零输入时，h 的增长率不会低于模型设定的最小值，
-        # 因此可以在理论最长寿命加观察窗口后结束仿真，避免积分完整视频。
-        # 若输入中有零值则不截断，因为零输入期间 h 会恢复。
-        if np.all(np.abs(current_sequence) > 1.0e-15):
-            maximum_lifetime_s = (
-                1.0 / self.model_parameters.minimum_strengthening_rate_per_s
+        # Continuous above-threshold input cannot outlast the longest fitted
+        # duration among its sampled currents, so avoid simulating the full clip.
+        if np.all(
+            np.abs(current_sequence)
+            >= self.model_parameters.minimum_oscillation_current_ma
+        ):
+            sampled_currents = np.unique(np.abs(current_sequence))
+            maximum_lifetime_s = max(
+                processor_lifetime_s
+                for processor_lifetime_s in (
+                    model.intrinsic_lifetime_s(float(current_ma))
+                    for current_ma in sampled_currents
+                )
             )
             simulation_duration_s = min(
                 simulation_duration_s,
@@ -318,6 +351,7 @@ class VideoPixelProcessor:
 
         frames = self.read_video_grayscale(video_path, start_frame=start_frame)
         current_array = self.pixel_to_current(frames)
+        self.validate_current_array(current_array)
         n_frames, height, width = current_array.shape
 
         # 三个结果图都用二维数组表示：每个像素都对应一个数值。
