@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import numpy as np
+from numbers import Integral
+from decimal import Decimal, InvalidOperation
 
 ELECTRON_CHARGE_C = 1.602176634e-19
 
@@ -26,7 +28,7 @@ def accumulate_phase_pulses(
     minimum_pulses: float = 0.0,
     maximum_pulses: float = 255.0,
 ) -> np.ndarray:
-    """Return fractional phase cycles clipped to the configured counter range."""
+    """Return phase cycles floored to the decimal precision of the bounds."""
     phase = np.asarray(phase_rad, dtype=float)
     starts = np.asarray(active_start_s, dtype=float)
     stops = np.asarray(active_stop_s, dtype=float)
@@ -40,6 +42,9 @@ def accumulate_phase_pulses(
         raise ValueError("phase and detector window map shapes do not match")
     if valid.shape != starts.shape:
         raise ValueError("valid_mask must match the pixel map shape")
+    pulse_precision = _pulse_precision_from_bounds(minimum_pulses, maximum_pulses)
+    minimum_pulses = float(minimum_pulses)
+    maximum_pulses = float(maximum_pulses)
     if not np.isfinite(minimum_pulses) or minimum_pulses < 0:
         raise ValueError("minimum_pulses must be finite and non-negative")
     if not np.isfinite(maximum_pulses) or maximum_pulses <= minimum_pulses:
@@ -55,12 +60,31 @@ def accumulate_phase_pulses(
         safe_stops = np.where(valid, stops, time_s[0])
         phase_start = _phase_at(phase, time_s, safe_starts)
         phase_stop = _phase_at(phase, time_s, safe_stops)
+        phase_cycles = (phase_stop[valid] - phase_start[valid]) / (2.0 * np.pi)
+        scale = 10.0 ** pulse_precision
+        phase_cycles = np.floor(np.nextafter(phase_cycles * scale, np.inf)) / scale
         counts[valid] = np.clip(
-            (phase_stop[valid] - phase_start[valid]) / (2.0 * np.pi),
+            phase_cycles,
             minimum_pulses,
             maximum_pulses,
         )
     return counts
+
+
+def _pulse_precision_from_bounds(minimum_pulses, maximum_pulses) -> int:
+    precisions = []
+    for value in (minimum_pulses, maximum_pulses):
+        if isinstance(value, Integral):
+            precisions.append(0)
+            continue
+        try:
+            decimal_value = Decimal(str(value))
+        except (InvalidOperation, ValueError):
+            raise ValueError("pulse bounds must be numeric") from None
+        if not decimal_value.is_finite():
+            raise ValueError("pulse bounds must be finite")
+        precisions.append(max(0, -decimal_value.as_tuple().exponent))
+    return max(precisions)
 
 
 def integrate_cmos_charge(

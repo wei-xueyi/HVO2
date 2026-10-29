@@ -1,6 +1,7 @@
 """Tests for shutter, detector, phase-array, and readout boundaries."""
 
 import unittest
+from decimal import Decimal
 
 import numpy as np
 
@@ -141,6 +142,23 @@ class HardwarePipelineTests(unittest.TestCase):
             maximum_pulses=255.0,
         )
         np.testing.assert_allclose(counts, [[12.5, 255.0]])
+
+    def test_accumulator_precision_follows_decimal_places_of_bounds(self):
+        phase = np.array([[[0.0, 4.92 * np.pi]]])
+        time = np.array([0.0, 1.0])
+        args = (phase, time, np.array([[0.0]]), np.array([[1.0]]), np.array([[True]]))
+        integer_counts = accumulate_phase_pulses(
+            *args, minimum_pulses=0, maximum_pulses=10,
+        )
+        tenths_counts = accumulate_phase_pulses(
+            *args, minimum_pulses=0.0, maximum_pulses=10.0,
+        )
+        hundredths_counts = accumulate_phase_pulses(
+            *args, minimum_pulses=Decimal("0.00"), maximum_pulses=Decimal("10.00"),
+        )
+        np.testing.assert_array_equal(integer_counts, [[2.0]])
+        np.testing.assert_array_equal(tenths_counts, [[2.4]])
+        np.testing.assert_array_equal(hundredths_counts, [[2.46]])
 
     def test_phase_pulse_accumulator_clamps_both_bounds_including_inactive_pixels(self):
         time = np.array([0.0, 1.0])
